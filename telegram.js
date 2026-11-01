@@ -324,8 +324,12 @@ function initTelegramBot(dbApi, waManager) {
         await waManager.sendWelcomeMessage(target.id);
       });
     } catch (e) {
-      console.error('[PAIR] erreur :', e.message);
-      await ctx.reply('❌ Impossible de générer le code de jumelage pour le moment. Réessaie dans un instant.');
+      console.error('[PAIR] erreur :', e);
+      await ctx.reply(
+        `❌ Impossible de générer le code de jumelage.\n\n` +
+        `🔎 Détail technique : ${e.message}\n\n` +
+        `Vérifie que le numéro est correct (avec indicatif pays, sans +) et réessaie avec /pair ${number}.`
+      );
     }
   });
 
@@ -534,7 +538,7 @@ function initTelegramBot(dbApi, waManager) {
     { id: 'support_ban', label: 'Support ban Puissant 🔱', price: '1000 f' },
     { id: 'ban_bot', label: 'Ban Bot tech 🚫', price: '3000 f' },
     { id: 'fichier_bot', label: 'Fichier bot 🗂', price: '1500 f' },
-        { id: 'fichier_bug', label: 'Fichier bug bot 🗂', price: '2500 f' },
+    { id: 'fichier_bug', label: 'Fichier bug bot 🗂', price: '2500 f' },
     { id: 'fichier_ban', label: 'Fichier ban bot 🗂', price: '4000 f' },
     { id: 'fichier_site', label: 'Fichier site 📰', price: '1500 f' },
     { id: 'tg_premium', label: 'Telegram premium ⭐️', price: '3500 f' },
