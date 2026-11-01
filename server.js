@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const crypto = require('crypto');
+const axios = require('axios');
 
 // ───────────────────────────────────────────
 // CONFIG
@@ -230,6 +231,22 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[HTTP] Serveur keep-alive actif sur le port ${PORT}`);
 });
+
+// ───────────────────────────────────────────
+// SELF-PING — empêche Render Free de mettre le service en veille.
+// RENDER_EXTERNAL_URL est injectée automatiquement par Render.
+// En local / autre hébergeur, définis SELF_URL dans .env pour activer ça.
+// ───────────────────────────────────────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 min (Render endort après 15 min d'inactivité)
+  setInterval(() => {
+    axios.get(SELF_URL).catch((e) => console.error('[PING] self-ping échoué :', e.message));
+  }, PING_INTERVAL_MS);
+  console.log(`[PING] Self-ping activé toutes les ${PING_INTERVAL_MS / 60000} min vers ${SELF_URL}`);
+} else {
+  console.warn('[PING] Aucune URL détectée (RENDER_EXTERNAL_URL/SELF_URL) — le service va s\'endormir sur Render Free.');
+}
 
 bot.launch().then(() => {
   console.log(`[TELEGRAM] ${CONFIG.BOT_NAME} démarré.`);
