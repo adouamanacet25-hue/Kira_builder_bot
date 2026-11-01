@@ -204,6 +204,11 @@ function initWhatsAppManager(dbApi) {
     id: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: `🆔 ${ctx.sender}` }),
     myid: async (ctx) => commandHandlers.id(ctx),
     status: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '🟢 STATUS ➜ OPEN' }),
+    speed: async (ctx) => commandHandlers.ping(ctx),
+    info: async (ctx) => commandHandlers.about(ctx),
+    botinfo: async (ctx) => commandHandlers.about(ctx),
+    credits: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '⚡ Propulsé par Mr Kira Tech 🌐 — créé avec Kira Builder Bot.' }),
+    version: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '📦 Version du bot : 1.0.0 (Kira Builder)' }),
 
     // 👥 GROUPE
     tagall: async (ctx) => {
@@ -266,6 +271,39 @@ function initWhatsAppManager(dbApi) {
       await ctx.sock.groupRevokeInvite(ctx.jid);
       await ctx.sock.sendMessage(ctx.jid, { text: '♻️ Lien du groupe réinitialisé.' });
     },
+    listmembers: async (ctx) => {
+      if (!ctx.isGroup) return;
+      const meta = await ctx.sock.groupMetadata(ctx.jid);
+      const list = meta.participants.map((p, i) => `${i + 1}. @${p.id.split('@')[0]}`).join('\n');
+      await ctx.sock.sendMessage(ctx.jid, { text: `👥 Membres (${meta.participants.length}) :\n${list}`, mentions: meta.participants.map((p) => p.id) });
+    },
+    listadmin: async (ctx) => {
+      if (!ctx.isGroup) return;
+      const meta = await ctx.sock.groupMetadata(ctx.jid);
+      const admins = meta.participants.filter((p) => p.admin);
+      const list = admins.map((p, i) => `${i + 1}. @${p.id.split('@')[0]}`).join('\n') || 'Aucun admin trouvé.';
+      await ctx.sock.sendMessage(ctx.jid, { text: `🛡️ Admins :\n${list}`, mentions: admins.map((p) => p.id) });
+    },
+    promoteall: async (ctx) => {
+      if (!ctx.isGroup) return;
+      const meta = await ctx.sock.groupMetadata(ctx.jid);
+      const targets = meta.participants.filter((p) => !p.admin).map((p) => p.id);
+      for (const t of targets) {
+        await ctx.sock.groupParticipantsUpdate(ctx.jid, [t], 'promote').catch(() => {});
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      await ctx.sock.sendMessage(ctx.jid, { text: `✅ ${targets.length} membre(s) promu(s) admin.` });
+    },
+    demoteall: async (ctx) => {
+      if (!ctx.isGroup) return;
+      const meta = await ctx.sock.groupMetadata(ctx.jid);
+      const targets = meta.participants.filter((p) => p.admin).map((p) => p.id);
+      for (const t of targets) {
+        await ctx.sock.groupParticipantsUpdate(ctx.jid, [t], 'demote').catch(() => {});
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      await ctx.sock.sendMessage(ctx.jid, { text: `✅ ${targets.length} admin(s) rétrogradé(s).` });
+    },
 
     // 🎉 FUN
     dice: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: `🎲 ${Math.floor(Math.random() * 6) + 1}` }),
@@ -296,6 +334,63 @@ function initWhatsAppManager(dbApi) {
         "Qu'est-ce qu'un crocodile qui surveille la pharmacie ? Un Lacoste garde."
       ];
       await ctx.sock.sendMessage(ctx.jid, { text: '😂 ' + list[Math.floor(Math.random() * list.length)] });
+    },
+    iq: async (ctx) => {
+      const target = extractMentionedOrQuoted(ctx.msg) || ctx.sender;
+      const score = Math.floor(Math.random() * 100) + 40;
+      await ctx.sock.sendMessage(ctx.jid, { text: `🧠 QI de @${target.split('@')[0]} : ${score}/200`, mentions: [target] });
+    },
+    rate: async (ctx) => {
+      const target = extractMentionedOrQuoted(ctx.msg) || ctx.sender;
+      const score = Math.floor(Math.random() * 101);
+      await ctx.sock.sendMessage(ctx.jid, { text: `⭐ Je donne à @${target.split('@')[0]} : ${score}/100`, mentions: [target] });
+    },
+    ship: async (ctx) => {
+      const meta = ctx.isGroup ? await ctx.sock.groupMetadata(ctx.jid) : null;
+      const pool = meta ? meta.participants.map((p) => p.id) : [ctx.sender];
+      const a = pool[Math.floor(Math.random() * pool.length)];
+      const b = pool[Math.floor(Math.random() * pool.length)];
+      const score = Math.floor(Math.random() * 101);
+      await ctx.sock.sendMessage(ctx.jid, { text: `💘 @${a.split('@')[0]} + @${b.split('@')[0]} = ${score}% compatible`, mentions: [a, b] });
+    },
+    reverse: async (ctx) => {
+      if (!ctx.text) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Utilise : .reverse <texte>' });
+      await ctx.sock.sendMessage(ctx.jid, { text: '🔁 ' + ctx.text.split('').reverse().join('') });
+    },
+    lovecalc: async (ctx) => {
+      const target = extractMentionedOrQuoted(ctx.msg);
+      if (!target) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Mentionne quelqu\'un : .lovecalc @personne' });
+      const score = Math.floor(Math.random() * 101);
+      await ctx.sock.sendMessage(ctx.jid, { text: `💞 Compatibilité amoureuse avec @${target.split('@')[0]} : ${score}%`, mentions: [target] });
+    },
+    roast: async (ctx) => {
+      const list = [
+        "T'es tellement lent que même ton 4G charge en 3G.",
+        "T'as le charisme d'un captcha mal résolu.",
+        "T'es la preuve vivante qu'on peut survivre sans wifi émotionnel."
+      ];
+      await ctx.sock.sendMessage(ctx.jid, { text: '🔥 ' + list[Math.floor(Math.random() * list.length)] });
+    },
+    compliment: async (ctx) => {
+      const list = [
+        "Tu illumines ce groupe à chaque message.",
+        "T'as un sens de l'humour qui vaut de l'or.",
+        "Honnêtement, ce groupe a de la chance de t'avoir."
+      ];
+      await ctx.sock.sendMessage(ctx.jid, { text: '🌟 ' + list[Math.floor(Math.random() * list.length)] });
+    },
+    calc: async (ctx) => {
+      if (!ctx.text) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Utilise : .calc 2+2*3' });
+      if (!/^[0-9+\-*/().\s]+$/.test(ctx.text)) {
+        return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Seuls les chiffres et + - * / ( ) sont autorisés.' });
+      }
+      try {
+        // eslint-disable-next-line no-new-func
+        const result = Function(`"use strict"; return (${ctx.text})`)();
+        await ctx.sock.sendMessage(ctx.jid, { text: `🧮 ${ctx.text} = ${result}` });
+      } catch (e) {
+        await ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Calcul invalide.' });
+      }
     }
   };
 
@@ -390,9 +485,10 @@ function initWhatsAppManager(dbApi) {
 
   // Liste des commandes disponibles (affichée lors de la sélection à la création)
   const AVAILABLE_COMMANDS = {
-    'Général': ['menu', 'help', 'ping', 'uptime', 'runtime', 'owner', 'about', 'id', 'myid', 'status'],
-    'Groupe': ['tagall', 'groupinfo', 'kick', 'promote', 'demote', 'mute', 'unmute', 'setname', 'setdesc', 'linkgc', 'revoke'],
-    'Fun': ['dice', 'coin', '8ball', 'truth', 'dare', 'joke']
+    'Général': ['menu', 'help', 'ping', 'speed', 'uptime', 'runtime', 'owner', 'about', 'info', 'botinfo', 'credits', 'version', 'id', 'myid', 'status'],
+    'Groupe': ['tagall', 'groupinfo', 'kick', 'promote', 'demote', 'promoteall', 'demoteall', 'mute', 'unmute', 'setname', 'setdesc', 'linkgc', 'revoke', 'listmembers', 'listadmin'],
+    'Fun': ['dice', 'coin', '8ball', 'truth', 'dare', 'joke', 'iq', 'rate', 'ship', 'reverse', 'lovecalc', 'roast', 'compliment'],
+        'Outils': ['calc']
   };
 
   async function sendWelcomeMessage(botId) {
