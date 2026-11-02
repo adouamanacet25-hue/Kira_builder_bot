@@ -121,7 +121,7 @@ function isUserPremiumActive(telegramId) {
   return true;
 }
 
-function createBot({ ownerTelegramId, ownerUsername, name, description, imageUrl, commands }) {
+function createBot({ ownerTelegramId, ownerUsername, name, description, imageUrl, commands, telegramToken, telegramUsername }) {
   const id = crypto.randomBytes(6).toString('hex');
   db.bots[id] = {
     id,
@@ -132,6 +132,8 @@ function createBot({ ownerTelegramId, ownerUsername, name, description, imageUrl
     imageUrl: imageUrl || CONFIG.IMAGES.profile,
     commands: commands || [],
     banned: false,
+    telegramToken: telegramToken || null,       // token BotFather du bot enfant
+    telegramUsername: telegramUsername || null, // @username du bot enfant sur Telegram
     waSession: { paired: false, phone: null, connectedAt: null },
     createdAt: Date.now()
   };
@@ -254,4 +256,3 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-    
