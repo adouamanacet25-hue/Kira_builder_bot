@@ -1,522 +1,258 @@
-// whatsapp.js — ҜIRΔ βUILDΣR βΩT
-// Gère les bots WhatsApp enfants (Baileys) : pairing code, connexion, commandes.
+// server.js — ҜIRΔ βUILDΣR βΩT
+// Point d'entrée : DB JSON, serveur Express (keep-alive), démarrage du bot Telegram mère.
 
-const path = require('path');
+require('dotenv').config();
 const fs = require('fs');
-const pino = require('pino');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+const path = require('path');
+const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
 
-const BAILEYS_BROWSER = ['Kira Builder', 'Chrome', '1.0.0'];
+// ───────────────────────────────────────────
+// CONFIG
+// ───────────────────────────────────────────
+const CONFIG = {
+  BOT_NAME: 'ҜIRΔ βUILDΣR βΩT 🌐',
+  AUTHOR: '⫸ 𝐌𝐫 𝐊𝐈𝐑𝐀 ┃ 𝗧𝗘𝗖𝗛 🌐 ⫷',
+  BOT_USERNAME: '@Kira_builder_bot',
+  BOT_LINK: 'https://t.me/Kira_builder_bot',
+  PREFIX: '.',
+  IMAGES: {
+    profile: 'https://i.ibb.co/mVsjwmyP/3-E8645-DC-2-F6-D-4537-B20-A-7-AB8-E05-ED051.jpg',
+    start: 'https://i.ibb.co/bj7PZsvr/5-F3656-DB-0-E7-A-4-DD4-91-D3-3-FC863-AF546-C.jpg',
+    link: 'https://i.ibb.co/DDBk2NNT/56824-E08-B4-EF-450-E-AAD6-CCFA986-D906-C.jpg',
+    everybot: 'https://i.ibb.co/wFbVFkwX/79-E7-F3-CE-4060-4-F2-B-9-F87-28-BA712-ACBF7.jpg',
+    welcome: 'https://i.ibb.co/23r50Phd/99-AA005-F-5704-483-C-AFB9-89-EFD1887138.jpg'
+  },
+  LINKS: {
+    channelTG: 'https://t.me/+mQ3aQpCsEqI0YmY0',
+    group1TG: 'https://t.me/+2JDC_Be4_ww1N2Vk',
+    group2TG: 'https://t.me/+Z-P_xjUgJjU0MjM0',
+    channelWA: 'https://whatsapp.com/channel/0029Vb7WJzp84OmBD0fEEJ2X',
+    groupWA: 'https://chat.whatsapp.com/IP0nFB79rMDF0nvFSMXtDR',
+    support: '@KIRA_SUPPORT_HUB'
+  },
+  KIRA_DEV_CODE: process.env.KIRA_DEV_CODE || 'Kira25',
+  GROUP2_ID: process.env.GROUP2_ID || null,
+  FREE_BOT_LIMIT: 2,
+  TRIES_DEFAULT: 3
+};
 
-function initWhatsAppManager(dbApi) {
-  const { CONFIG, SESSIONS_DIR, getBot, saveDB, db } = dbApi;
+// ───────────────────────────────────────────
+// DB (JSON file, chargée en mémoire + sauvegardée à chaque écriture)
+// ───────────────────────────────────────────
+const DB_PATH = path.join(__dirname, 'data', 'db.json');
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
-  // botId -> { sock, saveCreds, pairingResolvers: [] }
-  const sockets = new Map();
-  // botId -> telegramId du créateur en attente de notification de connexion
-  const pendingNotify = new Map();
+function ensureDirs() {
+  const dataDir = path.join(__dirname, 'data');
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+}
 
-  function fmtDate() {
-    const d = new Date();
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} / ${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
-  }
-
-  // ─────────────────────────────────────
-  // CRÉATION / CONNEXION D'UN SOCKET BOT
-  // ─────────────────────────────────────
-  async function startBotSocket(botId, { onPairingCode, onConnected, onDisconnected } = {}) {
-    const sessionPath = path.join(SESSIONS_DIR, botId);
-    if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-      browser: BAILEYS_BROWSER,
-      logger: pino({ level: 'silent' })
-    });
-
-    sockets.set(botId, { sock, saveCreds });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect } = update;
-
-      if (connection === 'open') {
-        const botRecord = getBot(botId);
-        if (botRecord) {
-          botRecord.waSession.paired = true;
-          botRecord.waSession.phone = sock.user && sock.user.id ? sock.user.id.split(':')[0] : null;
-          botRecord.waSession.connectedAt = Date.now();
-          db().stats.totalPairs += 1;
-          saveDB();
-        }
-        if (onConnected) onConnected(botId);
-      }
-
-      if (connection === 'close') {
-        const statusCode = lastDisconnect && lastDisconnect.error
-          ? new Boom(lastDisconnect.error).output.statusCode
-          : null;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-        if (loggedOut) {
-          const botRecord = getBot(botId);
-          if (botRecord) {
-            botRecord.waSession.paired = false;
-            botRecord.waSession.phone = null;
-            saveDB();
-          }
-          sockets.delete(botId);
-          if (onDisconnected) onDisconnected(botId, 'loggedout');
-        } else {
-          // reconnexion avec backoff simple
-          sockets.delete(botId);
-          setTimeout(() => {
-            startBotSocket(botId, { onPairingCode, onConnected, onDisconnected }).catch((e) =>
-              console.error(`[WA:${botId}] reconnexion échouée :`, e.message)
-            );
-          }, 3000);
-        }
-      }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
-      await handleIncomingMessage(botId, sock, msg).catch((e) =>
-        console.error(`[WA:${botId}] erreur handler message :`, e.message)
-      );
-    });
-
-    // Déclenche le pairing code si pas encore enregistré
-    if (!sock.authState.creds.registered && onPairingCode) {
-      await new Promise((r) => setTimeout(r, 1500));
-      onPairingCode(sock);
-    }
-
-    return sock;
-  }
-
-  async function requestPairing(botId, phoneNumber) {
-    return new Promise((resolve, reject) => {
-      startBotSocket(botId, {
-        onPairingCode: async (sock) => {
-          try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            resolve(code);
-          } catch (e) {
-            reject(e);
-          }
-        },
-        onConnected: (id) => {
-          const cb = pendingNotify.get(id);
-          if (cb) {
-            cb();
-            pendingNotify.delete(id);
-          }
-        }
-      }).catch(reject);
-    });
-  }
-
-  function onceConnected(botId, callback) {
-    pendingNotify.set(botId, callback);
-  }
-
-  async function unpairBot(botId) {
-    const entry = sockets.get(botId);
-    if (entry) {
-      try {
-        await entry.sock.logout();
-      } catch (_) {
-        /* ignore */
-      }
-      sockets.delete(botId);
-    }
-    const botRecord = getBot(botId);
-    if (botRecord) {
-      botRecord.waSession.paired = false;
-      botRecord.waSession.phone = null;
-      saveDB();
-    }
-    const sessionPath = path.join(SESSIONS_DIR, botId);
-    if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
-  }
-
-  function isConnected(botId) {
-    return sockets.has(botId) && getBot(botId) && getBot(botId).waSession.paired;
-  }
-
-  async function reconnectAllPairedBots() {
-    const all = Object.values(db().bots).filter((b) => b.waSession.paired);
-    for (const b of all) {
-      startBotSocket(b.id).catch((e) =>
-        console.error(`[WA:${b.id}] reconnexion au démarrage échouée :`, e.message)
-      );
-    }
-  }
-  reconnectAllPairedBots();
-
-  // ─────────────────────────────────────
-  // COMMANDES WHATSAPP (handlers réels)
-  // ─────────────────────────────────────
-  // Chaque handler reçoit (ctx) = { sock, msg, jid, sender, args, text, isGroup, botRecord, botId }
-  const commandHandlers = {
-    // 📘 GÉNÉRAL
-    menu: async (ctx) => sendChildMenu(ctx),
-    help: async (ctx) => sendChildMenu(ctx),
-    ping: async (ctx) => {
-      const start = Date.now();
-      const sent = await ctx.sock.sendMessage(ctx.jid, { text: '🏓 Calcul...' });
-      const latency = Date.now() - start;
-      await ctx.sock.sendMessage(ctx.jid, { text: `🏓 Pong ! Latence : ${latency} ms` }, { quoted: sent });
-    },
-    uptime: async (ctx) => {
-      const s = Math.floor(process.uptime());
-      const h = Math.floor(s / 3600);
-      const m = Math.floor((s % 3600) / 60);
-      const sec = s % 60;
-      await ctx.sock.sendMessage(ctx.jid, { text: `⏱️ Uptime : ${h}h ${m}m ${sec}s` });
-    },
-    runtime: async (ctx) => commandHandlers.uptime(ctx),
-    owner: async (ctx) => {
-      await ctx.sock.sendMessage(ctx.jid, {
-        text: `👤 Auteur du bot : @${ctx.botRecord.ownerUsername || 'inconnu'}`
-      });
-    },
-    about: async (ctx) => {
-      await ctx.sock.sendMessage(ctx.jid, {
-        text: `🤖 ${ctx.botRecord.name}\n${ctx.botRecord.description || ''}\n⚡ Propulsé par Mr Kira Tech 🌐`
-      });
-    },
-    id: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: `🆔 ${ctx.sender}` }),
-    myid: async (ctx) => commandHandlers.id(ctx),
-    status: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '🟢 STATUS ➜ OPEN' }),
-    speed: async (ctx) => commandHandlers.ping(ctx),
-    info: async (ctx) => commandHandlers.about(ctx),
-    botinfo: async (ctx) => commandHandlers.about(ctx),
-    credits: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '⚡ Propulsé par Mr Kira Tech 🌐 — créé avec Kira Builder Bot.' }),
-    version: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: '📦 Version du bot : 1.0.0 (Kira Builder)' }),
-
-    // 👥 GROUPE
-    tagall: async (ctx) => {
-      if (!ctx.isGroup) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Commande réservée aux groupes.' });
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      const mentions = meta.participants.map((p) => p.id);
-      const text = '📢 ' + mentions.map((id) => '@' + id.split('@')[0]).join(' ');
-      await ctx.sock.sendMessage(ctx.jid, { text, mentions });
-    },
-    groupinfo: async (ctx) => {
-      if (!ctx.isGroup) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Commande réservée aux groupes.' });
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      await ctx.sock.sendMessage(ctx.jid, {
-        text: `👥 ${meta.subject}\n📝 ${meta.desc || 'Aucune description'}\n👤 Membres : ${meta.participants.length}`
-      });
-    },
-    kick: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const target = extractMentionedOrQuoted(ctx.msg);
-      if (!target) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Mentionne ou réponds à la personne à expulser.' });
-      await ctx.sock.groupParticipantsUpdate(ctx.jid, [target], 'remove');
-    },
-    promote: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const target = extractMentionedOrQuoted(ctx.msg);
-      if (!target) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Mentionne la personne à promouvoir.' });
-      await ctx.sock.groupParticipantsUpdate(ctx.jid, [target], 'promote');
-    },
-    demote: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const target = extractMentionedOrQuoted(ctx.msg);
-      if (!target) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Mentionne la personne à rétrograder.' });
-      await ctx.sock.groupParticipantsUpdate(ctx.jid, [target], 'demote');
-    },
-    mute: async (ctx) => {
-      if (!ctx.isGroup) return;
-      await ctx.sock.groupSettingUpdate(ctx.jid, 'announcement');
-      await ctx.sock.sendMessage(ctx.jid, { text: '🔇 Groupe mis en mode "admins seulement".' });
-    },
-    unmute: async (ctx) => {
-      if (!ctx.isGroup) return;
-      await ctx.sock.groupSettingUpdate(ctx.jid, 'not_announcement');
-      await ctx.sock.sendMessage(ctx.jid, { text: '🔊 Tout le monde peut à nouveau écrire.' });
-    },
-    setname: async (ctx) => {
-      if (!ctx.isGroup || !ctx.text) return;
-      await ctx.sock.groupUpdateSubject(ctx.jid, ctx.text);
-    },
-    setdesc: async (ctx) => {
-      if (!ctx.isGroup || !ctx.text) return;
-      await ctx.sock.groupUpdateDescription(ctx.jid, ctx.text);
-    },
-    linkgc: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const code = await ctx.sock.groupInviteCode(ctx.jid);
-      await ctx.sock.sendMessage(ctx.jid, { text: `🔗 https://chat.whatsapp.com/${code}` });
-    },
-    revoke: async (ctx) => {
-      if (!ctx.isGroup) return;
-      await ctx.sock.groupRevokeInvite(ctx.jid);
-      await ctx.sock.sendMessage(ctx.jid, { text: '♻️ Lien du groupe réinitialisé.' });
-    },
-    listmembers: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      const list = meta.participants.map((p, i) => `${i + 1}. @${p.id.split('@')[0]}`).join('\n');
-      await ctx.sock.sendMessage(ctx.jid, { text: `👥 Membres (${meta.participants.length}) :\n${list}`, mentions: meta.participants.map((p) => p.id) });
-    },
-    listadmin: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      const admins = meta.participants.filter((p) => p.admin);
-      const list = admins.map((p, i) => `${i + 1}. @${p.id.split('@')[0]}`).join('\n') || 'Aucun admin trouvé.';
-      await ctx.sock.sendMessage(ctx.jid, { text: `🛡️ Admins :\n${list}`, mentions: admins.map((p) => p.id) });
-    },
-    promoteall: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      const targets = meta.participants.filter((p) => !p.admin).map((p) => p.id);
-      for (const t of targets) {
-        await ctx.sock.groupParticipantsUpdate(ctx.jid, [t], 'promote').catch(() => {});
-        await new Promise((r) => setTimeout(r, 800));
-      }
-      await ctx.sock.sendMessage(ctx.jid, { text: `✅ ${targets.length} membre(s) promu(s) admin.` });
-    },
-    demoteall: async (ctx) => {
-      if (!ctx.isGroup) return;
-      const meta = await ctx.sock.groupMetadata(ctx.jid);
-      const targets = meta.participants.filter((p) => p.admin).map((p) => p.id);
-      for (const t of targets) {
-        await ctx.sock.groupParticipantsUpdate(ctx.jid, [t], 'demote').catch(() => {});
-        await new Promise((r) => setTimeout(r, 800));
-      }
-      await ctx.sock.sendMessage(ctx.jid, { text: `✅ ${targets.length} admin(s) rétrogradé(s).` });
-    },
-
-    // 🎉 FUN
-    dice: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: `🎲 ${Math.floor(Math.random() * 6) + 1}` }),
-    coin: async (ctx) => ctx.sock.sendMessage(ctx.jid, { text: Math.random() < 0.5 ? '🪙 Pile' : '🪙 Face' }),
-    '8ball': async (ctx) => {
-      const answers = ['Oui', 'Non', 'Peut-être', 'Sans aucun doute', 'Je ne sais pas', 'Demande plus tard'];
-      await ctx.sock.sendMessage(ctx.jid, { text: '🎱 ' + answers[Math.floor(Math.random() * answers.length)] });
-    },
-    truth: async (ctx) => {
-      const list = [
-        "Quel est ton plus grand secret ?",
-        "Qui est ton crush actuel ?",
-        "Quelle est la chose la plus gênante que tu aies faite ?"
-      ];
-      await ctx.sock.sendMessage(ctx.jid, { text: '🧠 Vérité : ' + list[Math.floor(Math.random() * list.length)] });
-    },
-    dare: async (ctx) => {
-      const list = [
-        "Envoie un emoji au hasard dans le groupe.",
-        "Raconte une blague.",
-        "Change ta photo de profil pour 10 minutes."
-      ];
-      await ctx.sock.sendMessage(ctx.jid, { text: '🎯 Action : ' + list[Math.floor(Math.random() * list.length)] });
-    },
-    joke: async (ctx) => {
-      const list = [
-        "Pourquoi les plongeurs plongent-ils toujours en arrière ? Parce que sinon ils tombent dans le bateau.",
-        "Qu'est-ce qu'un crocodile qui surveille la pharmacie ? Un Lacoste garde."
-      ];
-      await ctx.sock.sendMessage(ctx.jid, { text: '😂 ' + list[Math.floor(Math.random() * list.length)] });
-    },
-    iq: async (ctx) => {
-      const target = extractMentionedOrQuoted(ctx.msg) || ctx.sender;
-      const score = Math.floor(Math.random() * 100) + 40;
-      await ctx.sock.sendMessage(ctx.jid, { text: `🧠 QI de @${target.split('@')[0]} : ${score}/200`, mentions: [target] });
-    },
-    rate: async (ctx) => {
-      const target = extractMentionedOrQuoted(ctx.msg) || ctx.sender;
-      const score = Math.floor(Math.random() * 101);
-      await ctx.sock.sendMessage(ctx.jid, { text: `⭐ Je donne à @${target.split('@')[0]} : ${score}/100`, mentions: [target] });
-    },
-    ship: async (ctx) => {
-      const meta = ctx.isGroup ? await ctx.sock.groupMetadata(ctx.jid) : null;
-      const pool = meta ? meta.participants.map((p) => p.id) : [ctx.sender];
-      const a = pool[Math.floor(Math.random() * pool.length)];
-      const b = pool[Math.floor(Math.random() * pool.length)];
-      const score = Math.floor(Math.random() * 101);
-      await ctx.sock.sendMessage(ctx.jid, { text: `💘 @${a.split('@')[0]} + @${b.split('@')[0]} = ${score}% compatible`, mentions: [a, b] });
-    },
-    reverse: async (ctx) => {
-      if (!ctx.text) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Utilise : .reverse <texte>' });
-      await ctx.sock.sendMessage(ctx.jid, { text: '🔁 ' + ctx.text.split('').reverse().join('') });
-    },
-    lovecalc: async (ctx) => {
-      const target = extractMentionedOrQuoted(ctx.msg);
-      if (!target) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Mentionne quelqu\'un : .lovecalc @personne' });
-      const score = Math.floor(Math.random() * 101);
-      await ctx.sock.sendMessage(ctx.jid, { text: `💞 Compatibilité amoureuse avec @${target.split('@')[0]} : ${score}%`, mentions: [target] });
-    },
-    roast: async (ctx) => {
-      const list = [
-        "T'es tellement lent que même ton 4G charge en 3G.",
-        "T'as le charisme d'un captcha mal résolu.",
-        "T'es la preuve vivante qu'on peut survivre sans wifi émotionnel."
-      ];
-      await ctx.sock.sendMessage(ctx.jid, { text: '🔥 ' + list[Math.floor(Math.random() * list.length)] });
-    },
-    compliment: async (ctx) => {
-      const list = [
-        "Tu illumines ce groupe à chaque message.",
-        "T'as un sens de l'humour qui vaut de l'or.",
-        "Honnêtement, ce groupe a de la chance de t'avoir."
-      ];
-      await ctx.sock.sendMessage(ctx.jid, { text: '🌟 ' + list[Math.floor(Math.random() * list.length)] });
-    },
-    calc: async (ctx) => {
-      if (!ctx.text) return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Utilise : .calc 2+2*3' });
-      if (!/^[0-9+\-*/().\s]+$/.test(ctx.text)) {
-        return ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Seuls les chiffres et + - * / ( ) sont autorisés.' });
-      }
-      try {
-        // eslint-disable-next-line no-new-func
-        const result = Function(`"use strict"; return (${ctx.text})`)();
-        await ctx.sock.sendMessage(ctx.jid, { text: `🧮 ${ctx.text} = ${result}` });
-      } catch (e) {
-        await ctx.sock.sendMessage(ctx.jid, { text: '⚠️ Calcul invalide.' });
-      }
-    }
-  };
-
-  function extractMentionedOrQuoted(msg) {
-    const ctxInfo = msg.message?.extendedTextMessage?.contextInfo;
-    if (ctxInfo?.mentionedJid?.length) return ctxInfo.mentionedJid[0];
-    if (ctxInfo?.participant) return ctxInfo.participant;
-    return null;
-  }
-
-  async function sendChildMenu(ctx) {
-    const b = ctx.botRecord;
-    const header =
-      `▉ ${b.name} 🌹▉\n` +
-      `✅ BOT ➜ Connecté 🤖\n` +
-      `🟢 STATUS ➜ OPEN\n` +
-      `📅 DATE ➜ ${fmtDate()}\n` +
-      `▰▰▰▰▰▰▰▰▰▰\n` +
-      `➠ Auteur : @${b.ownerUsername || 'inconnu'}\n` +
-      `➠ Préfixe : [ ${CONFIG.PREFIX} ]\n` +
-      `➠ Total Cmds : [ ${b.commands.length} ]\n`;
-
-    const list = b.commands.length
-      ? b.commands.map((c) => `• ${CONFIG.PREFIX}${c}`).join('\n')
-      : '(aucune commande sélectionnée)';
-
-    const footer = `\n\nEND…… 🌐\n\nPowered by Mr Kira Tech 🌐`;
-
-    await ctx.sock.sendMessage(ctx.jid, { image: { url: b.imageUrl }, caption: header });
-    await ctx.sock.sendMessage(ctx.jid, { text: list + footer });
-    await ctx.sock.sendMessage(ctx.jid, { text: CONFIG.LINKS.channelWA });
-  }
-
-  // ─────────────────────────────────────
-  // RÉCEPTION D'UN MESSAGE WHATSAPP
-  // ─────────────────────────────────────
-  async function handleIncomingMessage(botId, sock, msg) {
-    const botRecord = getBot(botId);
-    if (!botRecord) return;
-
-    if (botRecord.banned) {
-      const jid = msg.key.remoteJid;
-      await sock.sendMessage(jid, {
-        text: '⚠️ Erreur : ce bot a été banni du serveur. Contacte le support : ' + CONFIG.LINKS.support
-      });
-      return;
-    }
-
-    const jid = msg.key.remoteJid;
-    const isGroup = jid.endsWith('@g.us');
-    const sender = isGroup ? msg.key.participant : jid;
-
-    const body =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.imageMessage?.caption ||
-      '';
-
-    if (!body.startsWith(CONFIG.PREFIX)) return;
-
-    const withoutPrefix = body.slice(CONFIG.PREFIX.length).trim();
-    const [cmdRaw, ...args] = withoutPrefix.split(/\s+/);
-    const cmd = (cmdRaw || '').toLowerCase();
-
-    if (!botRecord.commands.includes(cmd)) return; // commande non activée pour ce bot
-    const handler = commandHandlers[cmd];
-    if (!handler) return;
-
-    db().stats.totalMessages += 1;
-    saveDB();
-
-    await sock.sendMessage(jid, { react: { text: '📋', key: msg.key } }).catch(() => {});
-
-    const ctx = {
-      sock,
-      msg,
-      jid,
-      sender,
-      args,
-      text: args.join(' '),
-      isGroup,
-      botRecord,
-      botId
-    };
-
-    try {
-      await handler(ctx);
-    } catch (e) {
-      console.error(`[WA:${botId}] erreur commande .${cmd} :`, e.message);
-    }
-  }
-
-  // Liste des commandes disponibles (affichée lors de la sélection à la création)
-  const AVAILABLE_COMMANDS = {
-    'Général': ['menu', 'help', 'ping', 'speed', 'uptime', 'runtime', 'owner', 'about', 'info', 'botinfo', 'credits', 'version', 'id', 'myid', 'status'],
-    'Groupe': ['tagall', 'groupinfo', 'kick', 'promote', 'demote', 'promoteall', 'demoteall', 'mute', 'unmute', 'setname', 'setdesc', 'linkgc', 'revoke', 'listmembers', 'listadmin'],
-    'Fun': ['dice', 'coin', '8ball', 'truth', 'dare', 'joke', 'iq', 'rate', 'ship', 'reverse', 'lovecalc', 'roast', 'compliment'],
-        'Outils': ['calc']
-  };
-
-  async function sendWelcomeMessage(botId) {
-    const botRecord = getBot(botId);
-    const entry = sockets.get(botId);
-    if (!botRecord || !entry || !botRecord.waSession.phone) return;
-    const jid = botRecord.waSession.phone + '@s.whatsapp.net';
-    const text =
-      `╔══════════════════════════╗\n` +
-      `✅ BOT ➜ Connecté 🤖\n` +
-      `🟢 STATUS ➜ OPEN\n` +
-      `📅 DATE ➜ ${fmtDate()}\n` +
-      `👤 Nom ➜ ${botRecord.name}\n` +
-      `⚜️ Auteur ➜ @${botRecord.ownerUsername || 'inconnu'}\n` +
-      `Tape : .menu pour continuer\n\n` +
-      `⚜️ BY ➜ Mr Kira Tech ⚜️\n` +
-      `╚══════════════════════════╝`;
-    await entry.sock.sendMessage(jid, { image: { url: CONFIG.IMAGES.welcome }, caption: text }).catch(() => {});
-  }
-
+function defaultDB() {
   return {
-    requestPairing,
-    onceConnected,
-    unpairBot,
-    isConnected,
-    AVAILABLE_COMMANDS,
-    sendWelcomeMessage
+    users: {},
+    bots: {},
+    promoCodes: {},
+    stats: { totalMessages: 0, totalBots: 0, totalPairs: 0 }
   };
 }
 
-module.exports = { initWhatsAppManager };
+let db;
+function loadDB() {
+  ensureDirs();
+  if (!fs.existsSync(DB_PATH)) {
+    db = defaultDB();
+    saveDB();
+  } else {
+    try {
+      db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    } catch (e) {
+      console.error('[DB] Fichier corrompu, recréation :', e.message);
+      db = defaultDB();
+      saveDB();
+    }
+  }
+  return db;
+}
+
+let saveTimer = null;
+function saveDB() {
+  // debounce léger pour éviter d'écrire sur disque à chaque micro-opération
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
+  }, 150);
+}
+
+function getUser(telegramId, meta = {}) {
+  const id = String(telegramId);
+  if (!db.users[id]) {
+    db.users[id] = {
+      username: meta.username || null,
+      firstName: meta.firstName || null,
+      triesLeft: CONFIG.TRIES_DEFAULT,
+      isPremium: false,
+      premiumUntil: null,
+      createdAt: Date.now()
+    };
+    saveDB();
+  } else if (meta.username || meta.firstName) {
+    db.users[id].username = meta.username || db.users[id].username;
+    db.users[id].firstName = meta.firstName || db.users[id].firstName;
+  }
+  return db.users[id];
+}
+
+function userBotCount(telegramId) {
+  return Object.values(db.bots).filter(b => b.ownerTelegramId === String(telegramId)).length;
+}
+
+function isUserPremiumActive(telegramId) {
+  const u = getUser(telegramId);
+  if (!u.isPremium) return false;
+  if (u.premiumUntil && Date.now() > u.premiumUntil) {
+    u.isPremium = false;
+    u.premiumUntil = null;
+    saveDB();
+    return false;
+  }
+  return true;
+}
+
+function createBot({ ownerTelegramId, ownerUsername, name, description, imageUrl, commands, telegramToken, telegramUsername }) {
+  const id = crypto.randomBytes(6).toString('hex');
+  db.bots[id] = {
+    id,
+    ownerTelegramId: String(ownerTelegramId),
+    ownerUsername: ownerUsername || null,
+    name,
+    description: description || '',
+    imageUrl: imageUrl || CONFIG.IMAGES.profile,
+    commands: commands || [],
+    banned: false,
+    telegramToken: telegramToken || null,       // token BotFather du bot enfant
+    telegramUsername: telegramUsername || null, // @username du bot enfant sur Telegram
+    waSession: { paired: false, phone: null, connectedAt: null },
+    createdAt: Date.now()
+  };
+  db.stats.totalBots += 1;
+  saveDB();
+  return db.bots[id];
+}
+
+function getBot(botId) {
+  return db.bots[botId];
+}
+
+function userBots(telegramId) {
+  return Object.values(db.bots).filter(b => b.ownerTelegramId === String(telegramId));
+}
+
+function deleteBot(botId) {
+  delete db.bots[botId];
+  const sessPath = path.join(SESSIONS_DIR, botId);
+  if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
+  saveDB();
+}
+
+function createPromoCode(code, { usesLeft = Infinity, ttlMs = 10 * 60 * 1000 } = {}) {
+  db.promoCodes[code] = {
+    createdAt: Date.now(),
+    expiresAt: Date.now() + ttlMs,
+    usedBy: [],
+    usesLeft,
+    premiumGranted: true
+  };
+  saveDB();
+  return db.promoCodes[code];
+}
+
+function redeemPromoCode(code, telegramId) {
+  const entry = db.promoCodes[code];
+  if (!entry) return { ok: false, reason: 'notfound' };
+  if (Date.now() > entry.expiresAt) return { ok: false, reason: 'expired' };
+  if (entry.usedBy.includes(String(telegramId))) return { ok: false, reason: 'already' };
+  if (entry.usesLeft <= 0) return { ok: false, reason: 'exhausted' };
+
+  entry.usedBy.push(String(telegramId));
+  if (entry.usesLeft !== Infinity) entry.usesLeft -= 1;
+
+  const u = getUser(telegramId);
+  u.triesLeft += 3;
+  u.isPremium = true;
+  u.premiumUntil = Date.now() + 10 * 60 * 1000; // 10 min comme spécifié
+  saveDB();
+  return { ok: true };
+}
+
+// ───────────────────────────────────────────
+// BOOTSTRAP
+// ───────────────────────────────────────────
+loadDB();
+
+const dbApi = {
+  CONFIG,
+  SESSIONS_DIR,
+  db: () => db,
+  saveDB,
+  getUser,
+  userBotCount,
+  isUserPremiumActive,
+  createBot,
+  getBot,
+  userBots,
+  deleteBot,
+  createPromoCode,
+  redeemPromoCode
+};
+
+const { initTelegramBot } = require('./telegram.js');
+const { initWhatsAppManager } = require('./whatsapp.js');
+
+const waManager = initWhatsAppManager(dbApi);
+const bot = initTelegramBot(dbApi, waManager);
+
+// ───────────────────────────────────────────
+// EXPRESS (keep-alive pour Render/VPS)
+// ───────────────────────────────────────────
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    bot: CONFIG.BOT_NAME,
+    totalBots: Object.keys(db.bots).length,
+    totalUsers: Object.keys(db.users).length,
+    uptime: process.uptime()
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`[HTTP] Serveur keep-alive actif sur le port ${PORT}`);
+});
+
+// ───────────────────────────────────────────
+// SELF-PING — empêche Render Free de mettre le service en veille.
+// RENDER_EXTERNAL_URL est injectée automatiquement par Render.
+// En local / autre hébergeur, définis SELF_URL dans .env pour activer ça.
+// ───────────────────────────────────────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+if (SELF_URL) {
+  const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 min (Render endort après 15 min d'inactivité)
+  setInterval(() => {
+    axios.get(SELF_URL).catch((e) => console.error('[PING] self-ping échoué :', e.message));
+  }, PING_INTERVAL_MS);
+  console.log(`[PING] Self-ping activé toutes les ${PING_INTERVAL_MS / 60000} min vers ${SELF_URL}`);
+} else {
+  console.warn('[PING] Aucune URL détectée (RENDER_EXTERNAL_URL/SELF_URL) — le service va s\'endormir sur Render Free.');
+}
+
+bot.launch().then(() => {
+  console.log(`[TELEGRAM] ${CONFIG.BOT_NAME} démarré.`);
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
