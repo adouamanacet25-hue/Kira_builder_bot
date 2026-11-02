@@ -1,8 +1,8 @@
 // telegram.js — ҜIRΔ βUILDΣR βΩT
-// Bot Telegram "mère" : création/gestion des bots WhatsApp, premium, admin.
+// Bot Telegram "mère" : crée et lance des bots Telegram ENFANTS indépendants
+// (chacun avec son propre token BotFather), qui gèrent eux-mêmes le pairing WhatsApp.
 
 const { Telegraf, Markup } = require('telegraf');
-const crypto = require('crypto');
 
 function initTelegramBot(dbApi, waManager) {
   const {
@@ -25,8 +25,10 @@ function initTelegramBot(dbApi, waManager) {
 
   const bot = new Telegraf(token);
 
-  // État de création de bot / saisie en cours, par utilisateur (en mémoire)
-  // { step: 'name'|'image'|'desc'|'commands'|'pair', data: {...} }
+  // botId -> instance Telegraf du bot ENFANT (chacun a son propre token/polling)
+  const childBots = new Map();
+
+  // État de saisie en cours, par utilisateur Telegram (en mémoire)
   const userState = new Map();
   function setState(id, state) { userState.set(String(id), state); }
   function getState(id) { return userState.get(String(id)); }
@@ -40,23 +42,25 @@ function initTelegramBot(dbApi, waManager) {
   // ─────────────────────────────────────
   // CLAVIERS
   // ─────────────────────────────────────
-  const linksKeyboard = Markup.inlineKeyboard([
+  const linksRows = [
     [Markup.button.url('🔵 📢 Suivre la chaîne Telegram', CONFIG.LINKS.channelTG)],
     [Markup.button.url('🟢 1️⃣ Rejoindre le groupe 1', CONFIG.LINKS.group1TG)],
     [Markup.button.url('🟢 2️⃣ Rejoindre le groupe 2', CONFIG.LINKS.group2TG)],
     [Markup.button.url('🟣 📢 Suivre la chaîne WhatsApp', CONFIG.LINKS.channelWA)],
-    [Markup.button.url('🟠 🌐 Rejoindre le groupe WhatsApp', CONFIG.LINKS.groupWA)],
-    [Markup.button.callback('🟡 ✅ Déjà rejoint', 'joined')]
-  ]);
+    [Markup.button.url('🟠 🌐 Rejoindre le groupe WhatsApp', CONFIG.LINKS.groupWA)]
+  ];
+  const linksKeyboard = Markup.inlineKeyboard([...linksRows, [Markup.button.callback('🟡 ✅ Déjà rejoint', 'joined')]]);
+  const linksKeyboardPlain = Markup.inlineKeyboard(linksRows);
 
   const afterJoinKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🔵 ✍️ Créer un bot', 'create_bot')],
     [Markup.button.callback('🟢 🤖 Liste de mes bots', 'my_bots')]
   ]);
 
-  // ─────────────────────────────────────
-  // /start
-  // ─────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // BOT MÈRE
+  // ═══════════════════════════════════════════════════════════
+
   bot.start(async (ctx) => {
     getUser(ctx.from.id, { username: ctx.from.username, firstName: ctx.from.first_name });
     const text =
@@ -74,16 +78,15 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.reply('Création de bot personnalisé ♻️', afterJoinKeyboard);
   });
 
-  // ─────────────────────────────────────
-  // /link
-  // ─────────────────────────────────────
-  bot.command('link', async (ctx) => {
-    await ctx.replyWithPhoto(CONFIG.IMAGES.link, { caption: '🔗 Nos liens officiels', ...linksKeyboard });
+  bot.action('my_bots', async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendMyBots(ctx);
   });
 
-  // ─────────────────────────────────────
-  // /help
-  // ─────────────────────────────────────
+  bot.command('link', async (ctx) => {
+    await ctx.replyWithPhoto(CONFIG.IMAGES.link, { caption: '🔗 Nos liens officiels', ...linksKeyboardPlain });
+  });
+
   bot.command('help', async (ctx) => {
     const text =
       `1️⃣ tapez /pair 242….\n` +
@@ -96,25 +99,20 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.replyWithPhoto(CONFIG.IMAGES.profile, { caption: text });
   });
 
-  // ─────────────────────────────────────
-  // /menu
-  // ─────────────────────────────────────
   bot.command('menu', async (ctx) => {
     const text =
       `📜 Menu ${CONFIG.BOT_NAME}\n\n` +
-      `/start /link /help /pair /unpair /mybot /bot /everybot /premium /code /shop /user /kira`;
+      `/start /link /help /mybot /bot /everybot /premium /code /shop /user /kira`;
     await ctx.replyWithPhoto(CONFIG.IMAGES.profile, { caption: text });
   });
 
-  // ─────────────────────────────────────
-  // /bot — lien du bot mère
-  // ─────────────────────────────────────
   bot.command('bot', async (ctx) => {
     await ctx.reply(`🤖 ${CONFIG.BOT_LINK}`);
   });
 
   // ─────────────────────────────────────
   // CRÉATION D'UN BOT — state machine
+  // name → image → description → commandes → token BotFather → lancement
   // ─────────────────────────────────────
   bot.action('create_bot', async (ctx) => {
     await ctx.answerCbQuery();
@@ -163,18 +161,66 @@ function initTelegramBot(dbApi, waManager) {
     if (!state || state.step !== 'commands') return ctx.answerCbQuery();
     await ctx.answerCbQuery();
 
+    if (state.data.editing) {
+      // édition des commandes d'un bot existant (pas de token à redemander)
+      const b = getBot(state.data.botId);
+      if (b) { b.commands = state.data.selectedCommands; saveDB(); }
+      clearState(ctx.from.id);
+      return ctx.reply('✅ Commandes mises à jour.');
+    }
+
+    state.step = 'token';
+    await ctx.reply(
+      `5️⃣ Dernière étape : va sur @BotFather, tape /newbot, suis les instructions, ` +
+      `puis colle ici le token qu'il te donne (ex: 123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx).\n\n` +
+      `⚠️ Ce token donne le contrôle total de ton bot — ne le partage avec personne d'autre que moi.`
+    );
+  });
+
+  async function finalizeNewBot(ctx, state, tokenValue) {
+    let me;
+    try {
+      const tmp = new Telegraf(tokenValue);
+      me = await tmp.telegram.getMe();
+    } catch (e) {
+      return ctx.reply('❌ Ce token est invalide ou déjà révoqué. Vérifie-le sur @BotFather et réessaie, ou envoie /bot pour annuler.');
+    }
+
+    // Empêche de réutiliser un token déjà lié à un autre bot de la plateforme
+    const already = Object.values(db().bots).find((b) => b.telegramToken === tokenValue);
+    if (already) {
+      return ctx.reply('❌ Ce token est déjà utilisé par un autre bot sur la plateforme.');
+    }
+
     const newBot = createBot({
       ownerTelegramId: ctx.from.id,
       ownerUsername: ctx.from.username,
       name: state.data.name,
       description: state.data.description,
       imageUrl: state.data.imageUrl,
-      commands: state.data.selectedCommands
+      commands: state.data.selectedCommands,
+      telegramToken: tokenValue,
+      telegramUsername: me.username
     });
 
     clearState(ctx.from.id);
-    await ctx.reply(`✅ Bot créé ! Envoie /pair <numéro> (sans le +) pour le connecter.\n\n🆔 Identifiant interne : ${newBot.id}`);
-  });
+
+    const recap =
+      `📝 Nom : ${newBot.name}\n` +
+      `✅ BOT → 🔓\n` +
+      `🟢 STATUS → OPEN\n` +
+      `📅 DATE → ${fmtDate()}\n` +
+      `👤 Auteur : @${ctx.from.username || ctx.from.id}\n` +
+      `🔑 Prefix : ${CONFIG.PREFIX}\n` +
+      `📦 Total Cmds : ${newBot.commands.length}\n` +
+      `🔗 lien du bot : @${me.username}\n\n` +
+      `⚡ Power by Mr Kira Tech 🌐`;
+
+    await ctx.replyWithPhoto(newBot.imageUrl, { caption: recap });
+    await ctx.reply(`✅ Ton bot @${me.username} est en ligne ! Va lui parler et tape /pair <numéro> sur CE bot (pas ici) pour connecter WhatsApp.`);
+
+    launchChildBot(newBot).catch((e) => console.error(`[CHILD:${newBot.id}] échec de lancement :`, e.message));
+  }
 
   bot.on('text', async (ctx, next) => {
     const state = getState(ctx.from.id);
@@ -204,6 +250,10 @@ function initTelegramBot(dbApi, waManager) {
         '4️⃣ Sélectionne les commandes à rajouter (clique pour cocher ✅, reclique pour décocher) :',
         commandSelectionKeyboard(state.data.selectedCommands)
       );
+    }
+
+    if (state.step === 'token') {
+      return finalizeNewBot(ctx, state, text);
     }
 
     if (state.step === 'kira_code') {
@@ -237,6 +287,20 @@ function initTelegramBot(dbApi, waManager) {
       return ctx.reply('❌ Code invalide.');
     }
 
+    if (state.step === 'rename_bot') {
+      const b = getBot(state.data.botId);
+      if (b) { b.name = text; saveDB(); }
+      clearState(ctx.from.id);
+      return ctx.reply('✅ Nom mis à jour.');
+    }
+
+    if (state.step === 'redesc_bot') {
+      const b = getBot(state.data.botId);
+      if (b) { b.description = text; saveDB(); }
+      clearState(ctx.from.id);
+      return ctx.reply('✅ Description mise à jour.');
+    }
+
     return next();
   });
 
@@ -252,104 +316,7 @@ function initTelegramBot(dbApi, waManager) {
   });
 
   // ─────────────────────────────────────
-  // /pair <numéro>
-  // ─────────────────────────────────────
-  bot.command('pair', async (ctx) => {
-    const parts = ctx.message.text.trim().split(/\s+/);
-    const number = parts[1];
-
-    if (!number || !/^\d{8,15}$/.test(number)) {
-      return ctx.reply(
-        `⚠️❌ ERREUR : NUMÉRO ERRONÉ ❌⚠️\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `🚫 Le numéro que tu as tapé est invalide.\n` +
-        `📲 Format correct : 242XXXXXXXX\n` +
-        `⛔ Sans le (+) devant.\n` +
-        `✅ Exemple : 242XXXXXXXX\n\n` +
-        `🔁 Réessaie : ➜ /pair 242XXXXXXXX\n` +
-        `━━━━━━━━━━━━━━━━━━━\n\n` +
-        `power by Mr kira tech 🌐`
-      );
-    }
-
-    const bots = userBots(ctx.from.id);
-    if (!bots.length) {
-      return ctx.reply("Tu n'as encore créé aucun bot. Tape /start pour commencer.");
-    }
-    // Dernier bot créé non encore pairé, sinon le dernier tout court
-    const target = bots.find((b) => !b.waSession.paired) || bots[bots.length - 1];
-
-    await ctx.reply(`📡 Demande en cours pour ${number}… 🔄`);
-
-    try {
-      const code = await waManager.requestPairing(target.id, number);
-      const text =
-        `━━━━━━━━━━━━━━━━━━━\n` +
-        `🌐 Bot : ${target.name}\n\n` +
-        `📲 PAIRING CODE pour ${number} ☑️\n\n` +
-        `━━━━━━━━━━━━━━━━━━━\n` +
-        `╔══════════════════════════╗\n` +
-        `🔑 CODE DE JUMELAGE : ${code}\n` +
-        `╚══════════════════════════╝\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `👉 INSTRUCTIONS :\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `1️⃣ Envoie ce code au numéro à connecter 📱\n` +
-        `2️⃣ Appareils liés 🔗 ➜ Lier un appareil ➕\n` +
-        `3️⃣ Entre ce code pour associer ce bot 🤖\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `✅ Une fois connecté, tape .menu pour continuer 📜\n` +
-        `━━━━━━━━━━━━━━━━━━━\n\n` +
-        `power by Mr Kira tech 🌐`;
-
-      await ctx.replyWithPhoto(target.imageUrl, {
-        caption: text,
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('📄 Copier le code', `copy_code:${code}`)]
-        ])
-      });
-
-      waManager.onceConnected(target.id, async () => {
-        const successText =
-          `✨━━━━━━━━━━━━━━━━━━━━✨\n` +
-          `🎊🎉 CONGRATULATIONS ! 🎉🎊\n` +
-          `✨━━━━━━━━━━━━━━━━━━━━✨\n\n` +
-          `╔══════════════════════════╗\n` +
-          `✅ BOT ➜ Connecté 🤖\n` +
-          `🟢 STATUS ➜ OPEN\n` +
-          `📅 DATE ➜ ${fmtDate()}\n` +
-          `⚜️ BY ➜ Mr Kira Tech ⚜️\n` +
-          `╚══════════════════════════╝`;
-        await ctx.replyWithPhoto(target.imageUrl, { caption: successText }).catch(() => {});
-        await waManager.sendWelcomeMessage(target.id);
-      });
-    } catch (e) {
-      console.error('[PAIR] erreur :', e);
-      await ctx.reply(
-        `❌ Impossible de générer le code de jumelage.\n\n` +
-        `🔎 Détail technique : ${e.message}\n\n` +
-        `Vérifie que le numéro est correct (avec indicatif pays, sans +) et réessaie avec /pair ${number}.`
-      );
-    }
-  });
-
-  bot.action(/copy_code:(.+)/, async (ctx) => {
-    await ctx.answerCbQuery(ctx.match[1], { show_alert: true });
-  });
-
-  // ─────────────────────────────────────
-  // /unpair
-  // ─────────────────────────────────────
-  bot.command('unpair', async (ctx) => {
-    const bots = userBots(ctx.from.id).filter((b) => b.waSession.paired);
-    if (!bots.length) return ctx.reply("Aucun bot connecté à déconnecter.");
-    const target = bots[bots.length - 1];
-    await waManager.unpairBot(target.id);
-    await ctx.reply(`🔌 Bot "${target.name}" déconnecté de WhatsApp.`);
-  });
-
-  // ─────────────────────────────────────
-  // /mybot
+  // /mybot — gestion des bots existants
   // ─────────────────────────────────────
   bot.command('mybot', async (ctx) => sendMyBots(ctx));
   async function sendMyBots(ctx) {
@@ -364,7 +331,7 @@ function initTelegramBot(dbApi, waManager) {
     const b = getBot(ctx.match[1]);
     if (!b) return ctx.reply('Bot introuvable (peut-être supprimé).');
     await ctx.reply(
-      `🤖 ${b.name}\n📦 ${b.commands.length} commande(s)\n🔌 ${b.waSession.paired ? 'Connecté' : 'Non connecté'}`,
+      `🤖 ${b.name} (@${b.telegramUsername || '?'})\n📦 ${b.commands.length} commande(s)\n🔌 WhatsApp : ${b.waSession.paired ? 'Connecté' : 'Non connecté'}\n${childBots.has(b.id) ? '🟢 Bot Telegram actif' : '🔴 Bot Telegram arrêté'}`,
       Markup.inlineKeyboard([
         [Markup.button.callback('✏️ Modifier le nom', `edit_name:${b.id}`)],
         [Markup.button.callback('📝 Modifier la description', `edit_desc:${b.id}`)],
@@ -399,55 +366,20 @@ function initTelegramBot(dbApi, waManager) {
     const b = getBot(ctx.match[1]);
     if (!b) return;
     await waManager.unpairBot(b.id);
+    stopChildBot(b.id);
     deleteBot(b.id);
     await ctx.reply(`🗑️ Bot "${b.name}" supprimé.`);
   });
 
-  // Gère la saisie texte pour rename / redesc / édition commandes d'un bot existant
-  bot.on('text', async (ctx, next) => {
-    const state = getState(ctx.from.id);
-    if (!state) return next();
-    const text = ctx.message.text.trim();
-
-    if (state.step === 'rename_bot') {
-      const b = getBot(state.data.botId);
-      if (b) { b.name = text; saveDB(); }
-      clearState(ctx.from.id);
-      return ctx.reply('✅ Nom mis à jour.');
-    }
-
-    if (state.step === 'redesc_bot') {
-      const b = getBot(state.data.botId);
-      if (b) { b.description = text; saveDB(); }
-      clearState(ctx.from.id);
-      return ctx.reply('✅ Description mise à jour.');
-    }
-
-    return next();
-  });
-
-  // Validation de l'édition des commandes d'un bot existant (réutilise validate_cmds)
-  bot.action('validate_cmds', async (ctx, next) => {
-    const state = getState(ctx.from.id);
-    if (state && state.data && state.data.editing) {
-      await ctx.answerCbQuery();
-      const b = getBot(state.data.botId);
-      if (b) { b.commands = state.data.selectedCommands; saveDB(); }
-      clearState(ctx.from.id);
-      return ctx.reply('✅ Commandes mises à jour.');
-    }
-    return next();
-  });
-
   // ─────────────────────────────────────
-  // /everybot
+  // /everybot /premium /code /user /shop /kira
   // ─────────────────────────────────────
   bot.command('everybot', async (ctx) => {
     const all = Object.values(db().bots);
     if (!all.length) {
       return ctx.replyWithPhoto(CONFIG.IMAGES.everybot, { caption: 'Aucun bot créé pour le moment.' });
     }
-    const list = all.map((b, i) => `${i + 1}• ${b.name} —> ${b.waSession.phone || b.id}`).join('\n');
+    const list = all.map((b, i) => `${i + 1}• ${b.name} —> @${b.telegramUsername || b.id}`).join('\n');
     const text =
       `╔══════════════════════════╗\n` +
       `👥 TOUS LES BOTS : (${all.length}) 🤖\n` +
@@ -456,9 +388,6 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.replyWithPhoto(CONFIG.IMAGES.everybot, { caption: text });
   });
 
-  // ─────────────────────────────────────
-  // /premium (Telegram Stars)
-  // ─────────────────────────────────────
   bot.command('premium', async (ctx) => {
     await ctx.reply(
       `💎 Passe Premium\n✅ 3 mois gratuits\n📲 Paiement via : [ ⭐️ start]`,
@@ -488,7 +417,7 @@ function initTelegramBot(dbApi, waManager) {
       title: `Premium Kira Builder (${months} mois)`,
       description: `Accès premium : création illimitée de bots pendant ${months} mois.`,
       payload: JSON.stringify({ months, telegramId: ctx.from.id }),
-      provider_token: '', // vide = obligatoire pour Telegram Stars (XTR)
+      provider_token: '',
       currency: 'XTR',
       prices: [{ label: `Premium ${months} mois`, amount: stars }]
     });
@@ -516,24 +445,15 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.reply('Tape /code puis ton code.');
   });
 
-  // ─────────────────────────────────────
-  // /code
-  // ─────────────────────────────────────
   bot.command('code', async (ctx) => {
     setState(ctx.from.id, { step: 'redeem_code', data: {} });
     await ctx.reply('🔐 Entre ton code promo :');
   });
 
-  // ─────────────────────────────────────
-  // /user
-  // ─────────────────────────────────────
   bot.command('user', async (ctx) => {
     await ctx.reply(`👥 Nombre d'utilisateurs : ${Object.keys(db().users).length}`);
   });
 
-  // ─────────────────────────────────────
-  // /shop
-  // ─────────────────────────────────────
   const SHOP_ITEMS = [
     { id: 'support_ban', label: 'Support ban Puissant 🔱', price: '1000 f' },
     { id: 'ban_bot', label: 'Ban Bot tech 🚫', price: '3000 f' },
@@ -581,9 +501,6 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.reply(CONFIG.LINKS.support);
   });
 
-  // ─────────────────────────────────────
-  // /kira — panel développeur
-  // ─────────────────────────────────────
   bot.command('kira', async (ctx) => {
     setState(ctx.from.id, { step: 'kira_code', data: {} });
     await ctx.reply("Code d'accès :");
@@ -599,7 +516,7 @@ function initTelegramBot(dbApi, waManager) {
     await ctx.answerCbQuery();
     const all = Object.values(db().bots);
     if (!all.length) return ctx.reply('Aucun bot à modifier.');
-    const rows = all.map((b) => [Markup.button.callback(`${b.banned ? '⛔' : '🤖'} ${b.name}`, `kira_bot:${b.id}`)]);
+        const rows = all.map((b) => [Markup.button.callback(`${b.banned ? '⛔' : '🤖'} ${b.name}`, `kira_bot:${b.id}`)]);
     await ctx.reply('📋 Tous les bots :', Markup.inlineKeyboard(rows));
   });
 
@@ -619,12 +536,193 @@ function initTelegramBot(dbApi, waManager) {
     if (!b) return;
     b.banned = !b.banned;
     saveDB();
+    if (b.banned) stopChildBot(b.id);
+    else launchChildBot(b).catch((e) => console.error(`[CHILD:${b.id}] relance échouée :`, e.message));
     await ctx.reply(`${b.banned ? '⛔ Bot banni.' : '✅ Bot débanni.'}`);
   });
 
   bot.catch((err, ctx) => {
-    console.error(`[TELEGRAM] Erreur sur update ${ctx.updateType} :`, err);
+    console.error(`[TELEGRAM:MÈRE] Erreur sur update ${ctx.updateType} :`, err);
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // FABRIQUE DE BOTS ENFANTS — chacun a son propre token BotFather
+  // ═══════════════════════════════════════════════════════════
+
+  async function doPair(ctx, botRecord, number) {
+    if (!number || !/^\d{8,15}$/.test(number)) {
+      return ctx.reply(
+        `⚠️❌ ERREUR : NUMÉRO ERRONÉ ❌⚠️\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🚫 Le numéro que tu as tapé est invalide.\n` +
+        `📲 Format correct : 242XXXXXXXX\n` +
+        `⛔ Sans le (+) devant.\n` +
+        `✅ Exemple : 242XXXXXXXX\n\n` +
+        `🔁 Réessaie : ➜ /pair 242XXXXXXXX\n` +
+        `━━━━━━━━━━━━━━━━━━━\n\n` +
+        `power by Mr kira tech 🌐`
+      );
+    }
+
+    if (botRecord.banned) return ctx.reply('⚠️ Erreur : ce bot a été banni du serveur. Contacte le support : ' + CONFIG.LINKS.support);
+
+    await ctx.reply(`📡 Demande en cours pour ${number}… 🔄`);
+
+    try {
+      const code = await waManager.requestPairing(botRecord.id, number);
+      const text =
+        `━━━━━━━━━━━━━━━━━━━\n` +
+        `🌐 Bot : ${botRecord.name}\n\n` +
+        `📲 PAIRING CODE pour ${number} ☑️\n\n` +
+        `━━━━━━━━━━━━━━━━━━━\n` +
+        `╔══════════════════════════╗\n` +
+        `🔑 CODE DE JUMELAGE : ${code}\n` +
+        `╚══════════════════════════╝\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `👉 INSTRUCTIONS :\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `1️⃣ Envoie ce code au numéro à connecter 📱\n` +
+        `2️⃣ Appareils liés 🔗 ➜ Lier un appareil ➕\n` +
+        `3️⃣ Entre ce code pour associer ce bot 🤖\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `✅ Une fois connecté, tape .menu pour continuer 📜\n` +
+        `━━━━━━━━━━━━━━━━━━━\n\n` +
+        `power by Mr Kira tech 🌐`;
+
+      await ctx.replyWithPhoto(botRecord.imageUrl, {
+        caption: text,
+        ...Markup.inlineKeyboard([[Markup.button.callback('📄 Copier le code', `copy_code:${code}`)]])
+      });
+
+      waManager.onceConnected(botRecord.id, async () => {
+        const successText =
+          `✨━━━━━━━━━━━━━━━━━━━━✨\n` +
+          `🎊🎉 CONGRATULATIONS ! 🎉🎊\n` +
+          `✨━━━━━━━━━━━━━━━━━━━━✨\n\n` +
+          `╔══════════════════════════╗\n` +
+          `✅ BOT ➜ Connecté 🤖\n` +
+          `🟢 STATUS ➜ OPEN\n` +
+          `📅 DATE ➜ ${fmtDate()}\n` +
+          `⚜️ BY ➜ Mr Kira Tech ⚜️\n` +
+          `╚══════════════════════════╝`;
+        await ctx.replyWithPhoto(botRecord.imageUrl, { caption: successText }).catch(() => {});
+        await waManager.sendWelcomeMessage(botRecord.id);
+      });
+    } catch (e) {
+      console.error(`[PAIR:${botRecord.id}] erreur :`, e);
+      await ctx.reply(
+        `❌ Impossible de générer le code de jumelage.\n\n` +
+        `🔎 Détail technique : ${e.message}\n\n` +
+        `Réessaie avec /pair ${number}.`
+      );
+    }
+  }
+
+  function childLinksKeyboard() {
+    return Markup.inlineKeyboard(linksRows);
+  }
+
+  async function launchChildBot(botRecord) {
+    if (!botRecord.telegramToken) return;
+    if (childBots.has(botRecord.id)) {
+      try { childBots.get(botRecord.id).stop('relaunch'); } catch (_) { /* ignore */ }
+      childBots.delete(botRecord.id);
+    }
+
+    const childBot = new Telegraf(botRecord.telegramToken);
+
+    childBot.start(async (ctx) => {
+      const current = getBot(botRecord.id);
+      if (!current) return;
+      const text =
+        `═══════════════════════════════════════════\n` +
+        ` ✦  WELCOME IN KIRA TECH HOUSE  🌐 ✦\n` +
+        `═══════════════════════════════════════════\n\n` +
+        `NAME       : ${current.name}\n` +
+        `CREATOR    : @${current.ownerUsername || 'inconnu'}\n\n` +
+        `───────────────────────────────────────────\n` +
+        `  DESCRIPTION\n` +
+        `───────────────────────────────────────────\n` +
+        `${current.description || 'THE BEST FOR CONNECT A ACCOUNT FOR OFF'}\n` +
+        `───────────────────────────────────────────\n` +
+        `Tape /menu pour voir le menu\n` +
+        `───────────────────────────────────────────`;
+      await ctx.replyWithPhoto(current.imageUrl, { caption: text, ...childLinksKeyboard() });
+    });
+
+    childBot.command('link', async (ctx) => {
+      await ctx.replyWithPhoto(CONFIG.IMAGES.link, { caption: '🔗 Nos liens officiels', ...childLinksKeyboard() });
+    });
+
+    childBot.command('help', async (ctx) => {
+      const current = getBot(botRecord.id);
+      const text =
+        `1️⃣ tapez /pair 242….\n` +
+        `2️⃣ récupérer le code pair ( xxxx-xxxx )\n` +
+        `3️⃣ allez sur whatsapp\n` +
+        `4️⃣ tapez sur trois points ( Android ) / paramètres ( iPhone )\n` +
+        `5️⃣ tapez appareil connecté\n` +
+        `6️⃣ saisir le code\n` +
+        `7️⃣ et tapez .menu`;
+      await ctx.replyWithPhoto((current || botRecord).imageUrl, { caption: text });
+    });
+
+    childBot.command('menu', async (ctx) => {
+      const current = getBot(botRecord.id);
+      const text =
+        `📜 Menu de ce bot\n\n` +
+        `/start /link /help /pair /unpair /bot /menu\n\n` +
+        `👉 Une fois connecté à WhatsApp, tape .menu directement dans WhatsApp pour voir les ${current ? current.commands.length : 0} commandes activées.`;
+      await ctx.replyWithPhoto((current || botRecord).imageUrl, { caption: text });
+    });
+
+    childBot.command('bot', async (ctx) => {
+      await ctx.reply(`🤖 Bot créé avec : ${CONFIG.BOT_LINK}`);
+    });
+
+    childBot.command('pair', async (ctx) => {
+      const current = getBot(botRecord.id);
+      if (!current) return ctx.reply('❌ Ce bot a été supprimé.');
+      const number = ctx.message.text.trim().split(/\s+/)[1];
+      await doPair(ctx, current, number);
+    });
+
+    childBot.command('unpair', async (ctx) => {
+      const current = getBot(botRecord.id);
+      if (!current || !current.waSession.paired) return ctx.reply('Aucun numéro connecté à déconnecter.');
+      await waManager.unpairBot(botRecord.id);
+      await ctx.reply('🔌 WhatsApp déconnecté de ce bot.');
+    });
+
+    childBot.action(/copy_code:(.+)/, async (ctx) => {
+      await ctx.answerCbQuery(ctx.match[1], { show_alert: true });
+    });
+
+    childBot.catch((err, ctx) => {
+      console.error(`[TELEGRAM:${botRecord.id}] Erreur sur update ${ctx.updateType} :`, err);
+    });
+
+    await childBot.launch();
+    childBots.set(botRecord.id, childBot);
+    console.log(`[CHILD:${botRecord.id}] Bot enfant "@${botRecord.telegramUsername}" lancé.`);
+  }
+
+  function stopChildBot(botId) {
+    const instance = childBots.get(botId);
+    if (instance) {
+      try { instance.stop('deleted_or_banned'); } catch (_) { /* ignore */ }
+      childBots.delete(botId);
+    }
+  }
+
+  // Relance tous les bots enfants déjà créés (au redémarrage du serveur)
+  async function reconnectAllChildBots() {
+    const all = Object.values(db().bots).filter((b) => b.telegramToken && !b.banned);
+    for (const b of all) {
+      launchChildBot(b).catch((e) => console.error(`[CHILD:${b.id}] reconnexion échouée :`, e.message));
+    }
+  }
+  reconnectAllChildBots();
 
   return bot;
 }
